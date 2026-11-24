@@ -235,11 +235,19 @@ def scanner_loop() -> None:
                             "• Nến H1 đã đóng cửa dưới vùng hỗ trợ cũ.\n• Cân nhắc canh nhịp hồi kiểm tra lại cản hoặc quản trị vị thế.\n• Tuân thủ SL để kiểm soát biến động vàng.",
                         )
                         send_telegram(
-                            f"🚀 *NẾN H1 VƯỢT KHÁNG CỰ & ĐÓNG CỬA*\n"
-                            f"• Kháng cự bị phá: `{zone_lvl:.2f}`\n"
+                            f"📉 *NẾN H1 PHÁ HỖ TRỢ & ĐÓNG CỬA*\n"
+                            f"• Hỗ trợ bị phá: `{zone_lvl:.2f}`\n"
                             f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
                             f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
                             f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
                             f"• Thời điểm nến: `{candle_ts}`\n\n"
                             f"🤖 *Góc nhìn AI:*\n{note}"
                         )
+
+                    last_alert_candle_ts = candle_ts
+                    last_signal_key = current_signal_key
+                    last_alert_ts = time.time()
+        except Exception as exc:
+            print(f"[ERROR] Lỗi trong scanner_loop: {exc}")
+
+        time.sleep(SCAN_INTERVAL)
