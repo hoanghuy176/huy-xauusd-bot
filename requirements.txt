@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 requests
-google-genai
-yfinance
 pandas
+yfinance
+google-genai
