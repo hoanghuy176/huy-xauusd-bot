@@ -15,7 +15,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 RENDER_URL = os.getenv("RENDER_URL", "https://huy-xauusd-bot.onrender.com").strip().rstrip("/")
 
-ZONE_BUFFER = float(os.getenv("ZONE_BUFFER", "2.5"))
 SL_BUFFER = float(os.getenv("SL_BUFFER", "3.0"))
 RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
@@ -144,8 +143,14 @@ def build_price_report() -> str:
     closed_time = str(closed_candle["candle_time"])
 
     supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
-    nearest_sup = max([s for s in supports if s <= current_price], default=min(supports) if supports else current_price - 5.0)
-    nearest_res = min([r for r in resistances if r >= current_price], default=max(resistances) if resistances else current_price + 5.0)
+    nearest_sup = max(
+        [s for s in supports if s <= current_price],
+        default=min(supports) if supports else current_price - 5.0,
+    )
+    nearest_res = min(
+        [r for r in resistances if r >= current_price],
+        default=max(resistances) if resistances else current_price + 5.0,
+    )
 
     ai_text = get_ai_note(
         (
@@ -153,101 +158,5 @@ def build_price_report() -> str:
             f"Hỗ trợ gần: {nearest_sup:.2f}, Kháng cự gần: {nearest_res:.2f}. "
             f"Viết 3 gạch đầu dòng ngắn gọn (dưới 60 từ) về kịch bản giao dịch H1 và quản lý rủi ro."
         ),
-        "• Ưu tiên quan sát phản ứng giá tại các vùng hỗ trợ/kháng cự H1.\n• Chỉ vào lệnh khi nến H1 đóng cửa xác nhận rõ ràng.\n• Luôn đặt SL chặt và tuân thủ tỷ lệ rủi ro/lợi nhuận.",
-    )
-
-    return (
-        f"📊 *CẬP NHẬT XAU/USD (H1 - GC=F)*\n"
-        f"• Giá hiện tại: `{current_price:.2f}`\n"
-        f"• Nến H1 vừa đóng (`{closed_time}`): `{closed_close:.2f}`\n"
-        f"• Hỗ trợ gần nhất: `{nearest_sup:.2f}`\n"
-        f"• Kháng cự gần nhất: `{nearest_res:.2f}`\n\n"
-        f"🤖 *Nhận định nhanh:*\n{ai_text}"
-    )
-
-
-def scanner_loop() -> None:
-    last_alert_candle_ts: Optional[str] = None
-    last_signal_key: Optional[str] = None
-    last_alert_ts: float = 0.0
-
-    while True:
-        try:
-            df = fetch_h1_data()
-            if df is not None and len(df) >= 20:
-                closed_candle = df.iloc[-2]
-                closed_close = float(closed_candle["Close"])
-                candle_ts = str(closed_candle["candle_time"])
-
-                supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
-
-                current_signal_key: Optional[str] = None
-                signal_payload: Optional[Tuple[str, float, float, float, float, float]] = None
-
-                # 1. Nến H1 vượt kháng cự và đóng cửa phía trên
-                for res_lvl in resistances:
-                    if closed_close > res_lvl:
-                        sl = round(res_lvl - SL_BUFFER, 2)
-                        risk = round(closed_close - sl, 2)
-                        if risk > 0:
-                            tp = round(closed_close + (RR_RATIO * risk), 2)
-                            current_signal_key = f"BREAK_UP_{round(res_lvl, 1)}"
-                            signal_payload = ("BREAK_UP", res_lvl, closed_close, sl, tp, risk)
-                        break
-
-                # 2. Nến H1 phá hỗ trợ và đóng cửa phía dưới
-                if not signal_payload:
-                    for sup_lvl in supports:
-                        if closed_close < sup_lvl:
-                            sl = round(sup_lvl + SL_BUFFER, 2)
-                            risk = round(sl - closed_close, 2)
-                            if risk > 0:
-                                tp = round(closed_close - (RR_RATIO * risk), 2)
-                                current_signal_key = f"BREAK_DOWN_{round(sup_lvl, 1)}"
-                                signal_payload = ("BREAK_DOWN", sup_lvl, closed_close, sl, tp, risk)
-                            break
-
-                # Chỉ thông báo khi có pha đóng nến phá cản MỚI và qua thời gian nghỉ
-                if (
-                    signal_payload
-                    and candle_ts != last_alert_candle_ts
-                    and current_signal_key != last_signal_key
-                    and (time.time() - last_alert_ts >= COOLDOWN_SECONDS)
-                ):
-                    side, zone_lvl, entry_px, sl, tp, risk = signal_payload
-                    if side == "BREAK_UP":
-                        note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa vượt Kháng cự {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}). Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đã đóng cửa trên vùng cản cũ.\n• Cân nhắc canh nhịp hồi retest hoặc chốt lời từng phần.\n• Giữ SL cố định để tránh quét râu.",
-                        )
-                        send_telegram(
-                            f"🚀 *NẾN H1 VƯỢT KHÁNG CỰ & ĐÓNG CỬA*\n"
-                            f"• Kháng cự bị phá: `{zone_lvl:.2f}`\n"
-                            f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
-                            f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
-                            f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
-                            f"• Thời điểm nến: `{candle_ts}`\n\n"
-                            f"🤖 *Góc nhìn AI:*\n{note}"
-                        )
-                    else:
-                        note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa phá Hỗ trợ {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}). Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đã đóng cửa dưới vùng hỗ trợ cũ.\n• Cân nhắc canh nhịp hồi kiểm tra lại cản hoặc quản trị vị thế.\n• Tuân thủ SL để kiểm soát biến động vàng.",
-                        )
-                        send_telegram(
-                            f"📉 *NẾN H1 PHÁ HỖ TRỢ & ĐÓNG CỬA*\n"
-                            f"• Hỗ trợ bị phá: `{zone_lvl:.2f}`\n"
-                            f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
-                            f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
-                            f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
-                            f"• Thời điểm nến: `{candle_ts}`\n\n"
-                            f"🤖 *Góc nhìn AI:*\n{note}"
-                        )
-
-                    last_alert_candle_ts = candle_ts
-                    last_signal_key = current_signal_key
-                    last_alert_ts = time.time()
-        except Exception as exc:
-            print(f"[ERROR] Lỗi trong scanner_loop: {exc}")
-
-        time.sleep(SCAN_INTERVAL)
+        "• Ưu tiên quan sát phản ứng giá tại các vùng hỗ trợ/kháng cự H1.\n"
+        "• Chỉ vào lệnh khi nến H1 đóng cửa xác nhận
