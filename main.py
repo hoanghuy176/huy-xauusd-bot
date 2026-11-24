@@ -18,7 +18,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 RENDER_URL = os.getenv("RENDER_URL", "https://huy-xauusd-bot.onrender.com").strip().rstrip("/")
 
 SL_BUFFER = float(os.getenv("SL_BUFFER", "3.0"))
-RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
+RR_RATIO = float(os.getenv("RR_RATIO", "1.3"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
