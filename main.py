@@ -3,13 +3,16 @@ import json
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests
 import yfinance as yf
 from fastapi import FastAPI, Request
 from google import genai
+
+VN_TZ = timezone(timedelta(hours=7))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -18,13 +21,35 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 RENDER_URL = os.getenv("RENDER_URL", "https://huy-xauusd-bot.onrender.com").strip().rstrip("/")
 
 SL_BUFFER = float(os.getenv("SL_BUFFER", "3.0"))
+BREAK_BUFFER = float(os.getenv("BREAK_BUFFER", "2.0"))
 RR_RATIO = float(os.getenv("RR_RATIO", "1.3"))
+SR_WINDOW = int(os.getenv("SR_WINDOW", "12"))
+SR_TOLERANCE = float(os.getenv("SR_TOLERANCE", "2.5"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 USE_MACD_FILTER = os.getenv("USE_MACD_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
 
-app = FastAPI(title="XAUUSD H1 Breakout Bot")
+# Các giờ (0..23 theo GMT+7) tạm ngưng bắn tín hiệu tự động để tránh thanh khoản yếu, ví dụ: "2,3,4,5"
+QUIET_HOURS_RAW = os.getenv("QUIET_HOURS_VN", "2,3,4,5").strip()
+
+
+def parse_quiet_hours(raw: str) -> Set[int]:
+    hours: Set[int] = set()
+    if not raw:
+        return hours
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            h = int(part)
+            if 0 <= h <= 23:
+                hours.add(h)
+    return hours
+
+
+QUIET_HOURS_VN: Set[int] = parse_quiet_hours(QUIET_HOURS_RAW)
+
+app = FastAPI(title="XAUUSD H1 Breakout Bot v2")
 
 gemini_client: Optional[genai.Client] = None
 if GEMINI_API_KEY:
@@ -112,7 +137,8 @@ def fetch_h1_data() -> Optional[pd.DataFrame]:
             df.columns = [col[0] for col in df.columns]
 
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-        if len(df) < 35:
+        min_bars = max(35, SR_WINDOW * 2 + 5)
+        if len(df) < min_bars:
             return None
 
         close_series = df["Close"].astype(float)
@@ -135,7 +161,9 @@ def fetch_h1_data() -> Optional[pd.DataFrame]:
         return None
 
 
-def find_sr_levels(df: pd.DataFrame, window: int = 8) -> Tuple[List[float], List[float]]:
+def find_sr_levels(
+    df: pd.DataFrame, window: int = SR_WINDOW, tolerance: float = SR_TOLERANCE
+) -> Tuple[List[float], List[float]]:
     highs = df["High"].astype(float).tolist()
     lows = df["Low"].astype(float).tolist()
     n = len(df)
@@ -153,19 +181,19 @@ def find_sr_levels(df: pd.DataFrame, window: int = 8) -> Tuple[List[float], List
         if cur_high == max(highs[i - window : i + window + 1]):
             raw_resistances.append(round(cur_high, 2))
 
-    def cluster_levels(levels: List[float], tolerance: float = 2.0) -> List[float]:
+    def cluster_levels(levels: List[float], tol: float) -> List[float]:
         if not levels:
             return []
         levels_sorted = sorted(levels)
         clustered: List[List[float]] = [[levels_sorted[0]]]
         for lvl in levels_sorted[1:]:
-            if abs(lvl - clustered[-1][-1]) <= tolerance:
+            if abs(lvl - clustered[-1][-1]) <= tol:
                 clustered[-1].append(lvl)
             else:
                 clustered.append([lvl])
         return [round(sum(group) / len(group), 2) for group in clustered]
 
-    return cluster_levels(raw_supports), cluster_levels(raw_resistances)
+    return cluster_levels(raw_supports, tolerance), cluster_levels(raw_resistances, tolerance)
 
 
 def macd_allows_side(side: str, macd_val: float, sig_val: float) -> bool:
@@ -176,6 +204,13 @@ def macd_allows_side(side: str, macd_val: float, sig_val: float) -> bool:
     if side == "BREAK_DOWN":
         return macd_val < sig_val
     return False
+
+
+def is_quiet_hour_vn() -> bool:
+    if not QUIET_HOURS_VN:
+        return False
+    cur_hour_vn = datetime.now(VN_TZ).hour
+    return cur_hour_vn in QUIET_HOURS_VN
 
 
 def format_macd_summary(macd_val: float, sig_val: float, hist_val: float) -> str:
@@ -213,7 +248,7 @@ def build_price_report() -> str:
     hist_val = float(closed_candle["macd_hist"])
     macd_txt = format_macd_summary(macd_val, sig_val, hist_val)
 
-    supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
+    supports, resistances = find_sr_levels(df.iloc[:-1], window=SR_WINDOW, tolerance=SR_TOLERANCE)
     nearest_sup = max(
         [s for s in supports if s <= current_price],
         default=min(supports) if supports else current_price - 5.0,
@@ -254,8 +289,12 @@ def scanner_loop() -> None:
 
     while True:
         try:
+            if is_quiet_hour_vn():
+                time.sleep(SCAN_INTERVAL)
+                continue
+
             df = fetch_h1_data()
-            if df is not None and len(df) >= 35:
+            if df is not None and len(df) >= max(35, SR_WINDOW * 2 + 5):
                 closed_candle = df.iloc[-2]
                 closed_close = float(closed_candle["Close"])
                 candle_ts = str(closed_candle["candle_time"])
@@ -264,13 +303,15 @@ def scanner_loop() -> None:
                 sig_val = float(closed_candle["macd_signal"])
                 hist_val = float(closed_candle["macd_hist"])
 
-                supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
+                supports, resistances = find_sr_levels(
+                    df.iloc[:-1], window=SR_WINDOW, tolerance=SR_TOLERANCE
+                )
 
                 current_signal_key: Optional[str] = None
                 signal_payload: Optional[Tuple[str, float, float, float, float, float]] = None
 
                 for res_lvl in resistances:
-                    if closed_close > res_lvl:
+                    if closed_close > (res_lvl + BREAK_BUFFER):
                         if not macd_allows_side("BREAK_UP", macd_val, sig_val):
                             break
                         sl = round(res_lvl - SL_BUFFER, 2)
@@ -283,7 +324,7 @@ def scanner_loop() -> None:
 
                 if not signal_payload:
                     for sup_lvl in supports:
-                        if closed_close < sup_lvl:
+                        if closed_close < (sup_lvl - BREAK_BUFFER):
                             if not macd_allows_side("BREAK_DOWN", macd_val, sig_val):
                                 break
                             sl = round(sup_lvl + SL_BUFFER, 2)
@@ -306,14 +347,14 @@ def scanner_loop() -> None:
 
                     if side == "BREAK_UP":
                         note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa vượt Kháng cự {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} > Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đóng cửa trên cản và MACD ủng hộ đà tăng.\n"
-                            "• Cân nhắc canh nhịp hồi retest hoặc chốt lời từng phần.\n"
-                            "• Giữ SL cố định để tránh quét râu.",
+                            f"Nến H1 XAU/USD đóng cửa vượt Kháng cự {zone_lvl:.2f} (+ đệm {BREAK_BUFFER:.1f}) tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} > Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
+                            "• Nến H1 đóng cửa vượt cản có đệm xác nhận và MACD ủng hộ tăng.\n"
+                            "• Cân nhắc canh nhịp hồi retest hoặc chia TP quản trị lệnh.\n"
+                            "• Giữ SL cố định để kiểm soát rủi ro.",
                         )
                         send_telegram(
                             f"🚀 *NẾN H1 VƯỢT KHÁNG CỰ & ĐÓNG CỬA*\n"
-                            f"• Kháng cự bị phá: `{zone_lvl:.2f}`\n"
+                            f"• Kháng cự bị phá: `{zone_lvl:.2f}` (đệm `{BREAK_BUFFER:.1f}`)\n"
                             f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
                             f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
                             f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
@@ -323,14 +364,14 @@ def scanner_loop() -> None:
                         )
                     else:
                         note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa phá Hỗ trợ {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} < Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đóng cửa dưới hỗ trợ và MACD ủng hộ đà giảm.\n"
+                            f"Nến H1 XAU/USD đóng cửa phá Hỗ trợ {zone_lvl:.2f} (- đệm {BREAK_BUFFER:.1f}) tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} < Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
+                            "• Nến H1 đóng cửa dưới hỗ trợ có đệm xác nhận và MACD ủng hộ giảm.\n"
                             "• Cân nhắc canh nhịp hồi kiểm tra lại cản hoặc quản trị vị thế.\n"
-                            "• Tuân thủ SL để kiểm soát biến động vàng.",
+                            "• Tuân thủ SL để tránh quét râu biến động vàng.",
                         )
                         send_telegram(
                             f"📉 *NẾN H1 PHÁ HỖ TRỢ & ĐÓNG CỬA*\n"
-                            f"• Hỗ trợ bị phá: `{zone_lvl:.2f}`\n"
+                            f"• Hỗ trợ bị phá: `{zone_lvl:.2f}` (đệm `{BREAK_BUFFER:.1f}`)\n"
                             f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
                             f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
                             f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
@@ -365,7 +406,14 @@ async def on_startup() -> None:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check() -> Dict[str, Any]:
-    return {"status": "ok", "bot": "xauusd-h1-breakout", "macd_filter": USE_MACD_FILTER}
+    return {
+        "status": "ok",
+        "bot": "xauusd-h1-breakout-v2",
+        "macd_filter": USE_MACD_FILTER,
+        "break_buffer": BREAK_BUFFER,
+        "rr_ratio": RR_RATIO,
+        "quiet_hours_vn": sorted(list(QUIET_HOURS_VN)),
+    }
 
 
 @app.post("/telegram-webhook")
