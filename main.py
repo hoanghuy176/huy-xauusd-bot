@@ -1,7 +1,11 @@
 def build_fallback_message(sig: Dict[str, Any]) -> str:
     im = sig["intermarket"]
     news = sig["news"]
-    warn_sl = "\n⚠️ *Cảnh báo:* SL vượt trần rủi ro cấu hình!" if sig["est_loss_usd"] > MAX_RISK_PER_TRADE_USD else ""
+    warn_sl = (
+        f"\n⚠️ *Cảnh báo:* Ước lỗ `~${sig['est_loss_usd']}` vượt trần `${MAX_RISK_PER_TRADE_USD:g}`!"
+        if sig["est_loss_usd"] > MAX_RISK_PER_TRADE_USD
+        else ""
+    )
 
     lines = [
         f"🚨 *XAU/USD [{sig['tf'].upper()}] — {sig['side_label']}*",
@@ -69,7 +73,9 @@ def build_status_message() -> str:
         "",
         f"• *Vốn:* `${ACCOUNT_CAPITAL_USD:g}`",
         f"• *Lot:* `{LOT_SIZE}`",
-        f"• *TP1 / TP2 / TP3:* `{RR_RATIO}R / {TP2_RATIO}R / {TP3_RATIO}R`",
+        f"• *TP1:* `{RR_RATIO}R`",
+        f"• *TP2:* `{TP2_RATIO}R`",
+        f"• *TP3:* `{TP3_RATIO}R`",
         f"• *Khung nghỉ:* `{sorted(QUIET_HOURS_VN)}`",
         f"• *Trạng thái nghỉ:* `{'CÓ' if is_quiet_hour() else 'KHÔNG'}`",
     ]
