@@ -22,6 +22,7 @@ RR_RATIO = float(os.getenv("RR_RATIO", "1.3"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
+USE_MACD_FILTER = os.getenv("USE_MACD_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(title="XAUUSD H1 Breakout Bot")
 
@@ -103,7 +104,7 @@ def register_webhook() -> None:
 
 def fetch_h1_data() -> Optional[pd.DataFrame]:
     try:
-        df = yf.download("GC=F", period="10d", interval="1h", progress=False, auto_adjust=False)
+        df = yf.download("GC=F", period="14d", interval="1h", progress=False, auto_adjust=False)
         if df is None or df.empty:
             return None
 
@@ -111,8 +112,19 @@ def fetch_h1_data() -> Optional[pd.DataFrame]:
             df.columns = [col[0] for col in df.columns]
 
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-        if len(df) < 25:
+        if len(df) < 35:
             return None
+
+        close_series = df["Close"].astype(float)
+        ema_fast = close_series.ewm(span=12, adjust=False).mean()
+        ema_slow = close_series.ewm(span=26, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        hist = macd_line - signal_line
+
+        df["macd"] = macd_line
+        df["macd_signal"] = signal_line
+        df["macd_hist"] = hist
 
         df = df.reset_index()
         time_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
@@ -156,6 +168,21 @@ def find_sr_levels(df: pd.DataFrame, window: int = 8) -> Tuple[List[float], List
     return cluster_levels(raw_supports), cluster_levels(raw_resistances)
 
 
+def macd_allows_side(side: str, macd_val: float, sig_val: float) -> bool:
+    if not USE_MACD_FILTER:
+        return True
+    if side == "BREAK_UP":
+        return macd_val > sig_val
+    if side == "BREAK_DOWN":
+        return macd_val < sig_val
+    return False
+
+
+def format_macd_summary(macd_val: float, sig_val: float, hist_val: float) -> str:
+    trend = "Tăng (MACD > Signal)" if macd_val > sig_val else "Giảm (MACD < Signal)"
+    return f"{trend} | MACD: `{macd_val:.2f}`, Signal: `{sig_val:.2f}`, Hist: `{hist_val:+.2f}`"
+
+
 def get_ai_note(prompt: str, fallback: str) -> str:
     if not gemini_client:
         return fallback
@@ -181,6 +208,11 @@ def build_price_report() -> str:
     closed_close = float(closed_candle["Close"])
     closed_time = str(closed_candle["candle_time"])
 
+    macd_val = float(closed_candle["macd"])
+    sig_val = float(closed_candle["macd_signal"])
+    hist_val = float(closed_candle["macd_hist"])
+    macd_txt = format_macd_summary(macd_val, sig_val, hist_val)
+
     supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
     nearest_sup = max(
         [s for s in supports if s <= current_price],
@@ -195,10 +227,11 @@ def build_price_report() -> str:
         (
             f"Giá XAU/USD (GC=F) hiện tại: {current_price:.2f}, nến H1 đóng gần nhất ({closed_time}) ở {closed_close:.2f}. "
             f"Hỗ trợ gần: {nearest_sup:.2f}, Kháng cự gần: {nearest_res:.2f}. "
-            f"Viết 3 gạch đầu dòng ngắn gọn (dưới 60 từ) về kịch bản giao dịch H1 và quản lý rủi ro."
+            f"MACD (12,26,9) nến đóng: MACD={macd_val:.2f}, Signal={sig_val:.2f}, Hist={hist_val:+.2f}. "
+            f"Viết 3 gạch đầu dòng ngắn gọn (dưới 60 từ) về kịch bản giao dịch H1, động lượng MACD và quản lý rủi ro."
         ),
         "• Ưu tiên quan sát phản ứng giá tại các vùng hỗ trợ/kháng cự H1.\n"
-        "• Chỉ vào lệnh khi nến H1 đóng cửa xác nhận rõ ràng.\n"
+        "• Đối chiếu hướng MACD (12,26,9) để lọc động lượng thuận chiều break.\n"
         "• Luôn đặt SL chặt và tuân thủ tỷ lệ rủi ro/lợi nhuận.",
     )
 
@@ -207,7 +240,8 @@ def build_price_report() -> str:
         f"• Giá hiện tại: `{current_price:.2f}`\n"
         f"• Nến H1 vừa đóng (`{closed_time}`): `{closed_close:.2f}`\n"
         f"• Hỗ trợ gần nhất: `{nearest_sup:.2f}`\n"
-        f"• Kháng cự gần nhất: `{nearest_res:.2f}`\n\n"
+        f"• Kháng cự gần nhất: `{nearest_res:.2f}`\n"
+        f"• MACD (12,26,9): {macd_txt}\n\n"
         f"🤖 *Nhận định nhanh:*\n{ai_text}"
     )
 
@@ -221,10 +255,14 @@ def scanner_loop() -> None:
     while True:
         try:
             df = fetch_h1_data()
-            if df is not None and len(df) >= 20:
+            if df is not None and len(df) >= 35:
                 closed_candle = df.iloc[-2]
                 closed_close = float(closed_candle["Close"])
                 candle_ts = str(closed_candle["candle_time"])
+
+                macd_val = float(closed_candle["macd"])
+                sig_val = float(closed_candle["macd_signal"])
+                hist_val = float(closed_candle["macd_hist"])
 
                 supports, resistances = find_sr_levels(df.iloc[:-1], window=8)
 
@@ -233,6 +271,8 @@ def scanner_loop() -> None:
 
                 for res_lvl in resistances:
                     if closed_close > res_lvl:
+                        if not macd_allows_side("BREAK_UP", macd_val, sig_val):
+                            break
                         sl = round(res_lvl - SL_BUFFER, 2)
                         risk = round(closed_close - sl, 2)
                         if risk > 0:
@@ -244,6 +284,8 @@ def scanner_loop() -> None:
                 if not signal_payload:
                     for sup_lvl in supports:
                         if closed_close < sup_lvl:
+                            if not macd_allows_side("BREAK_DOWN", macd_val, sig_val):
+                                break
                             sl = round(sup_lvl + SL_BUFFER, 2)
                             risk = round(sl - closed_close, 2)
                             if risk > 0:
@@ -260,10 +302,12 @@ def scanner_loop() -> None:
                     and (now_ts - last_alert_ts >= COOLDOWN_SECONDS)
                 ):
                     side, zone_lvl, entry_px, sl, tp, risk = signal_payload
+                    macd_txt = format_macd_summary(macd_val, sig_val, hist_val)
+
                     if side == "BREAK_UP":
                         note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa vượt Kháng cự {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}). Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đã đóng cửa trên vùng cản cũ.\n"
+                            f"Nến H1 XAU/USD đóng cửa vượt Kháng cự {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} > Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
+                            "• Nến H1 đóng cửa trên cản và MACD ủng hộ đà tăng.\n"
                             "• Cân nhắc canh nhịp hồi retest hoặc chốt lời từng phần.\n"
                             "• Giữ SL cố định để tránh quét râu.",
                         )
@@ -273,13 +317,14 @@ def scanner_loop() -> None:
                             f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
                             f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
                             f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
+                            f"• MACD (12,26,9): {macd_txt}\n"
                             f"• Thời điểm nến: `{candle_ts}`\n\n"
                             f"🤖 *Góc nhìn AI:*\n{note}"
                         )
                     else:
                         note = get_ai_note(
-                            f"Nến H1 XAU/USD đóng cửa phá Hỗ trợ {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}). Viết 3 gạch đầu dòng dưới 50 từ.",
-                            "• Nến H1 đã đóng cửa dưới vùng hỗ trợ cũ.\n"
+                            f"Nến H1 XAU/USD đóng cửa phá Hỗ trợ {zone_lvl:.2f} tại {entry_px:.2f}, SL {sl:.2f}, TP {tp:.2f} (R:R 1:{RR_RATIO:.1f}), MACD={macd_val:.2f} < Signal={sig_val:.2f}. Viết 3 gạch đầu dòng dưới 50 từ.",
+                            "• Nến H1 đóng cửa dưới hỗ trợ và MACD ủng hộ đà giảm.\n"
                             "• Cân nhắc canh nhịp hồi kiểm tra lại cản hoặc quản trị vị thế.\n"
                             "• Tuân thủ SL để kiểm soát biến động vàng.",
                         )
@@ -289,6 +334,7 @@ def scanner_loop() -> None:
                             f"• *Entry (đóng nến H1):* `{entry_px:.2f}`\n"
                             f"• *Stop Loss (1R):* `{sl:.2f}` (-{risk:.2f} giá)\n"
                             f"• *Take Profit ({RR_RATIO:.1f}R):* `{tp:.2f}` (+{RR_RATIO * risk:.2f} giá)\n"
+                            f"• MACD (12,26,9): {macd_txt}\n"
                             f"• Thời điểm nến: `{candle_ts}`\n\n"
                             f"🤖 *Góc nhìn AI:*\n{note}"
                         )
@@ -319,7 +365,7 @@ async def on_startup() -> None:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check() -> Dict[str, Any]:
-    return {"status": "ok", "bot": "xauusd-h1-breakout"}
+    return {"status": "ok", "bot": "xauusd-h1-breakout", "macd_filter": USE_MACD_FILTER}
 
 
 @app.post("/telegram-webhook")
