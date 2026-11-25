@@ -22,7 +22,7 @@ logger = logging.getLogger("xauusd-bot")
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / os.getenv("STATE_FILE", "state.json")
 
-# Khung thời gian & tỷ lệ R:R 1:2 động theo S/R + ATR
+# Khung thời gian & target động theo S/R + ATR (R:R 1:2)
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 TF_TREND = "1d"
 TF_ENTRY = "1h"
@@ -152,7 +152,7 @@ def series_atr(candles: List[Dict[str, Any]], length: int = 14) -> List[Optional
 
 async def get_ohlc(symbol: str, interval: str, count: int = 120) -> List[Dict[str, Any]]:
     if not TD_API_KEY:
-        raise RuntimeError("Thiếu TWELVE_DATA_API_KEY trong file .env")
+        raise RuntimeError("Thiếu TWELVE_DATA_API_KEY trong biến môi trường")
 
     params = {
         "symbol": symbol,
@@ -282,11 +282,6 @@ def compute_dynamic_sl_tp(
     sr_slice: List[Dict[str, Any]],
     atr_h1: float,
 ) -> Optional[Tuple[float, float, float, float, str]]:
-    """
-    Tính SL theo vùng Hỗ trợ/Kháng cự gần nhất trên H1 + đệm ATR,
-    và tính TP theo tỷ lệ RR_RATIO (mặc định 1:2).
-    Trả về (sl_price, tp_price, sl_dist, tp_dist, sr_ref_text).
-    """
     buffer = atr_h1 * ATR_BUFFER_MULT
 
     if side == "BUY":
@@ -296,4 +291,224 @@ def compute_dynamic_sl_tp(
             return None
         sl_dist = max(MIN_SL_POINTS, min(MAX_SL_POINTS, raw_sl_dist))
         tp_dist = sl_dist * RR_RATIO
-        sl_price
+        sl_price = round(entry - sl_dist, 2)
+        tp_price = round(entry + tp_dist, 2)
+        return sl_price, tp_price, round(sl_dist, 2), round(tp_dist, 2), f"Hỗ trợ {support_level:.2f}"
+
+    if side == "SELL":
+        resistance_level = max(c["high"] for c in sr_slice)
+        raw_sl_dist = (resistance_level - entry) + buffer
+        if raw_sl_dist <= 0:
+            return None
+        sl_dist = max(MIN_SL_POINTS, min(MAX_SL_POINTS, raw_sl_dist))
+        tp_dist = sl_dist * RR_RATIO
+        sl_price = round(entry + sl_dist, 2)
+        tp_price = round(entry - tp_dist, 2)
+        return sl_price, tp_price, round(sl_dist, 2), round(tp_dist, 2), f"Kháng cự {resistance_level:.2f}"
+
+    return None
+
+
+def build_h1_signal(
+    d1_candles: List[Dict[str, Any]],
+    h1_candles: List[Dict[str, Any]],
+    macro_dir: str,
+    macro_text: str,
+) -> Optional[Dict[str, Any]]:
+    d1_dir, d1_note = get_d1_direction(d1_candles)
+    LATEST_SNAPSHOT["d1_bias"] = f"{d1_dir} ({d1_note})"
+
+    if d1_dir == "NONE":
+        return None
+
+    min_bars = max(EMA_H1_LEN, RSI_LEN, ATR_LEN, LOOKBACK_H1, SR_LOOKBACK) + 3
+    if len(h1_candles) < min_bars:
+        return None
+
+    closed_h1 = h1_candles[-2]
+    LATEST_SNAPSHOT["last_closed_h1"] = closed_h1["time"]
+
+    lookback_slice = h1_candles[-(LOOKBACK_H1 + 2) : -2]
+    sr_slice = h1_candles[-(SR_LOOKBACK + 2) : -2]
+    if len(lookback_slice) < LOOKBACK_H1 or len(sr_slice) < SR_LOOKBACK:
+        return None
+
+    h1_closes = [c["close"] for c in h1_candles]
+    ema_h1 = series_ema(h1_closes, EMA_H1_LEN)[-2]
+    rsi_h1 = series_rsi(h1_closes, RSI_LEN)[-2]
+    atr_h1 = series_atr(h1_candles, ATR_LEN)[-2]
+
+    if ema_h1 is None or rsi_h1 is None or atr_h1 is None:
+        return None
+    if atr_h1 < MIN_ATR_H1:
+        return None
+
+    high_ref = max(c["high"] for c in lookback_slice)
+    low_ref = min(c["low"] for c in lookback_slice)
+    entry = round(closed_h1["close"], 2)
+
+    if d1_dir == "BUY":
+        if macro_dir == "USD_UP":
+            return None
+        if closed_h1["close"] > high_ref and closed_h1["close"] > ema_h1 and rsi_h1 <= RSI_OVERBOUGHT:
+            calc = compute_dynamic_sl_tp("BUY", entry, sr_slice, atr_h1)
+            if not calc:
+                return None
+            sl_price, tp_price, sl_dist, tp_dist, sr_ref = calc
+            return {
+                "side": "BUY",
+                "time": closed_h1["time"],
+                "entry": entry,
+                "sl": sl_price,
+                "tp": tp_price,
+                "sl_dist": sl_dist,
+                "tp_dist": tp_dist,
+                "rr": f"1:{RR_RATIO:g}",
+                "ind": f"EMA{EMA_H1_LEN}={ema_h1:.2f} | RSI={rsi_h1:.1f} | ATR={atr_h1:.2f}",
+                "sr_ref": sr_ref,
+                "macro": macro_text,
+                "trend": d1_note,
+            }
+
+    if d1_dir == "SELL":
+        if macro_dir == "USD_DOWN":
+            return None
+        if closed_h1["close"] < low_ref and closed_h1["close"] < ema_h1 and rsi_h1 >= RSI_OVERSOLD:
+            calc = compute_dynamic_sl_tp("SELL", entry, sr_slice, atr_h1)
+            if not calc:
+                return None
+            sl_price, tp_price, sl_dist, tp_dist, sr_ref = calc
+            return {
+                "side": "SELL",
+                "time": closed_h1["time"],
+                "entry": entry,
+                "sl": sl_price,
+                "tp": tp_price,
+                "sl_dist": sl_dist,
+                "tp_dist": tp_dist,
+                "rr": f"1:{RR_RATIO:g}",
+                "ind": f"EMA{EMA_H1_LEN}={ema_h1:.2f} | RSI={rsi_h1:.1f} | ATR={atr_h1:.2f}",
+                "sr_ref": sr_ref,
+                "macro": macro_text,
+                "trend": d1_note,
+            }
+
+    return None
+
+
+async def send_tg(msg: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logger.warning("Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID.")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            url,
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+        )
+        res.raise_for_status()
+
+
+def format_tg_signal(sig: Dict[str, Any], news_text: str) -> str:
+    badge = "🟢" if sig["side"] == "BUY" else "🔴"
+    return (
+        f"{badge} <b>{SYMBOL} | D1 → H1 | {sig['side']}</b>\n"
+        f"• Khung vào lệnh: <code>H1</code> (Nến đóng: <code>{sig['time']}</code>)\n"
+        f"• Entry: <code>{sig['entry']:.2f}</code>\n"
+        f"• SL: <code>{sig['sl']:.2f}</code> (<code>{sig['sl_dist']:.2f}</code> giá | {sig['sr_ref']})\n"
+        f"• TP: <code>{sig['tp']:.2f}</code> (<code>{sig['tp_dist']:.2f}</code> giá | R:R <code>{sig['rr']}</code>)\n"
+        f"• Xu hướng D1: {sig['trend']}\n"
+        f"• Chỉ báo H1: {sig['ind']}\n"
+        f"• DXY & US10Y: {sig['macro']}\n"
+        f"• Tin tức: {news_text}"
+    )
+
+
+async def scan_once() -> None:
+    LATEST_SNAPSHOT["last_check_utc"] = datetime.now(timezone.utc).isoformat()
+    LATEST_SNAPSHOT["last_error"] = None
+
+    blocked, news_text = await get_news_filter()
+    LATEST_SNAPSHOT["news_status"] = news_text
+    if blocked:
+        logger.info("Tạm dừng vào lệnh: %s", news_text)
+        return
+
+    d1_candles, h1_candles = await asyncio.gather(
+        get_ohlc(SYMBOL, TF_TREND, count=max(EMA_D1_LEN + 20, 80)),
+        get_ohlc(
+            SYMBOL,
+            TF_ENTRY,
+            count=max(EMA_H1_LEN, RSI_LEN, ATR_LEN, LOOKBACK_H1, SR_LOOKBACK) + 40,
+        ),
+    )
+
+    macro_dir, macro_text = await get_macro_view()
+    LATEST_SNAPSHOT["macro_summary"] = macro_text
+
+    sig = build_h1_signal(d1_candles, h1_candles, macro_dir, macro_text)
+    if not sig:
+        return
+
+    state = read_state()
+    sent_keys: List[str] = state.setdefault("sent_keys", [])
+    sig_key = f"{sig['side']}@{sig['time']}"
+    if sig_key in sent_keys:
+        return
+
+    await send_tg(format_tg_signal(sig, news_text))
+    sent_keys.append(sig_key)
+    state["sent_keys"] = sent_keys[-100:]
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_state(state)
+    logger.info("Đã gửi tín hiệu Telegram %s", sig_key)
+
+
+async def scanner_loop() -> None:
+    while True:
+        try:
+            await scan_once()
+        except Exception as exc:
+            LATEST_SNAPSHOT["last_error"] = str(exc)
+            logger.error("Lỗi quét D1/H1: %s", exc)
+        await asyncio.sleep(LOOP_SECONDS)
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    logger.info(
+        "Bot sẵn sàng | %s | D1 -> H1 | Dynamic S/R + ATR | R:R 1:%g",
+        SYMBOL,
+        RR_RATIO,
+    )
+    asyncio.create_task(scanner_loop())
+
+
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {
+        "service": "huy-xauusd-bot",
+        "status": "live",
+        "endpoints": ["/health", "/status"],
+    }
+
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "symbol": SYMBOL,
+        "trend_tf": TF_TREND,
+        "entry_tf": TF_ENTRY,
+        "target_mode": "dynamic_sr_atr",
+        "rr": f"1:{RR_RATIO:g}",
+    }
+
+
+@app.get("/status")
+async def status() -> Dict[str, Any]:
+    return LATEST_SNAPSHOT
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
