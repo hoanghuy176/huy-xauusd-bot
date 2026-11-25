@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("xauusd-tv-webhook")
+logger = logging.getLogger("xauusd-tv-macd-bot")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / os.getenv("STATE_FILE", "state.json")
@@ -24,23 +24,23 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 RR_RATIO = float(os.getenv("RR_RATIO", "2.0"))
-ATR_BUFFER_MULT = float(os.getenv("ATR_BUFFER_MULT", "0.25"))
-MIN_SL_POINTS = float(os.getenv("MIN_SL_POINTS", "3.0"))
-MAX_SL_POINTS = float(os.getenv("MAX_SL_POINTS", "25.0"))
+MIN_SL_POINTS = float(os.getenv("MIN_SL_POINTS", "2.5"))
+MAX_SL_POINTS = float(os.getenv("MAX_SL_POINTS", "30.0"))
+SR_BUFFER = float(os.getenv("SR_BUFFER", "0.5"))
 
-NEWS_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"
 NEWS_WINDOW_MIN = int(os.getenv("NEWS_WINDOW_MINUTES", "60"))
-NEWS_URL = os.getenv(
-    "NEWS_FEED_URL",
+BLOCK_ON_CPI_NFP = os.getenv("BLOCK_ON_CPI_NFP", "true").lower() == "true"
+FF_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-)
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+]
 
-app = FastAPI(title="XAUUSD TradingView Webhook Bot")
+app = FastAPI(title="XAUUSD TradingView MACD + S/R + CPI/NFP Bot")
 
 LATEST_STATUS: Dict[str, Any] = {
     "last_webhook_utc": None,
     "last_signal": None,
-    "news_status": "Chưa kiểm tra",
+    "cpi_nfp_status": "Chưa kiểm tra",
     "last_error": None,
 }
 
@@ -66,69 +66,101 @@ def write_state(data: Dict[str, Any]) -> None:
         logger.error("Lỗi ghi state.json: %s", exc)
 
 
-async def check_usd_high_news() -> tuple[bool, str]:
-    if not NEWS_ENABLED:
-        return False, "Tắt lọc tin"
+def is_cpi_or_nfp(title: str) -> Optional[str]:
+    t = title.lower()
+    if "cpi" in t or "consumer price index" in t:
+        return "CPI"
+    if "non-farm" in t or "nonfarm" in t or "nfp" in t:
+        return "Non-Farm (NFP)"
+    return None
+
+
+async def check_cpi_nfp_forexfactory() -> Tuple[bool, str]:
     now_utc = datetime.now(timezone.utc)
     window = timedelta(minutes=NEWS_WINDOW_MIN)
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            res = await client.get(NEWS_URL, headers={"User-Agent": "Mozilla/5.0"})
-            res.raise_for_status()
-            events = res.json()
+    upcoming_alerts: List[str] = []
 
-        if not isinstance(events, list):
-            return False, "Không có dữ liệu lịch"
+    for url in FF_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if res.status_code != 200:
+                    continue
+                events = res.json()
 
-        for ev in events:
-            if str(ev.get("country", "")).upper() != "USD":
-                continue
-            if str(ev.get("impact", "")).lower() != "high":
-                continue
-            raw_date = str(ev.get("date", "")).strip()
-            if not raw_date:
-                continue
-            try:
-                ev_dt = datetime.fromisoformat(raw_date)
-                ev_dt = (
-                    ev_dt.replace(tzinfo=timezone.utc)
-                    if ev_dt.tzinfo is None
-                    else ev_dt.astimezone(timezone.utc)
-                )
-            except ValueError:
+            if not isinstance(events, list):
                 continue
 
-            if abs(ev_dt - now_utc) <= window:
-                title = str(ev.get("title", "USD High Impact"))
-                return True, f"Chặn tin: {title} ({ev_dt.strftime('%H:%M UTC')})"
+            for ev in events:
+                if str(ev.get("country", "")).upper() != "USD":
+                    continue
+                title = str(ev.get("title", "")).strip()
+                tag = is_cpi_or_nfp(title)
+                if not tag:
+                    continue
 
-        return False, "An toàn (không có tin USD High sát giờ)"
-    except Exception as exc:
-        logger.warning("Lỗi tải lịch tin: %s", exc)
-        return False, "Bỏ qua do lỗi nguồn tin"
+                raw_date = str(ev.get("date", "")).strip()
+                if not raw_date:
+                    continue
+                try:
+                    ev_dt = datetime.fromisoformat(raw_date)
+                    ev_dt = (
+                        ev_dt.replace(tzinfo=timezone.utc)
+                        if ev_dt.tzinfo is None
+                        else ev_dt.astimezone(timezone.utc)
+                    )
+                except ValueError:
+                    continue
+
+                diff = ev_dt - now_utc
+                if abs(diff) <= window:
+                    mins = int(diff.total_seconds() // 60)
+                    info = f"{tag}: {title} ({ev_dt.strftime('%Y-%m-%d %H:%M UTC')}, {mins:+d}p)"
+                    if BLOCK_ON_CPI_NFP:
+                        return True, f"CHẶN LỆNH | {info}"
+                    upcoming_alerts.append(info)
+                elif timedelta(0) < diff <= timedelta(hours=24):
+                    upcoming_alerts.append(
+                        f"{tag}: {title} ({ev_dt.strftime('%m-%d %H:%M UTC')})"
+                    )
+        except Exception as exc:
+            logger.warning("Lỗi đọc lịch ForexFactory (%s): %s", url, exc)
+
+    if upcoming_alerts:
+        return False, "Cảnh báo sắp tới | " + " ; ".join(dict.fromkeys(upcoming_alerts)[:3])
+    return False, "Không có tin CPI / Non-Farm sát giờ"
 
 
-def compute_sl_tp(
+def calc_sr_sl_tp(
     side: str,
     entry: float,
-    atr: float,
-    swing_high: Optional[float],
-    swing_low: Optional[float],
-) -> tuple[float, float, float, float, str]:
-    buffer = max(atr, 0.0) * ATR_BUFFER_MULT
-
+    support: Optional[float],
+    resistance: Optional[float],
+) -> Tuple[float, float, float, float, str]:
     if side == "BUY":
-        anchor = swing_low if swing_low is not None else (entry - max(MIN_SL_POINTS, atr * 1.5))
-        raw_dist = max((entry - anchor) + buffer, 0.5)
+        level = support if support is not None else (entry - 6.0)
+        raw_dist = abs(entry - level) + SR_BUFFER
         sl_dist = max(MIN_SL_POINTS, min(MAX_SL_POINTS, raw_dist))
         tp_dist = sl_dist * RR_RATIO
-        return round(entry - sl_dist, 2), round(entry + tp_dist, 2), round(sl_dist, 2), round(tp_dist, 2), f"Hỗ trợ {anchor:.2f}"
+        return (
+            round(entry - sl_dist, 2),
+            round(entry + tp_dist, 2),
+            round(sl_dist, 2),
+            round(tp_dist, 2),
+            f"Hỗ trợ {level:.2f}",
+        )
 
-    anchor = swing_high if swing_high is not None else (entry + max(MIN_SL_POINTS, atr * 1.5))
-    raw_dist = max((anchor - entry) + buffer, 0.5)
+    level = resistance if resistance is not None else (entry + 6.0)
+    raw_dist = abs(level - entry) + SR_BUFFER
     sl_dist = max(MIN_SL_POINTS, min(MAX_SL_POINTS, raw_dist))
     tp_dist = sl_dist * RR_RATIO
-    return round(entry + sl_dist, 2), round(entry - tp_dist, 2), round(sl_dist, 2), round(tp_dist, 2), f"Kháng cự {anchor:.2f}"
+    return (
+        round(entry + sl_dist, 2),
+        round(entry - tp_dist, 2),
+        round(sl_dist, 2),
+        round(tp_dist, 2),
+        f"Kháng cự {level:.2f}",
+    )
 
 
 async def send_telegram(text: str) -> None:
@@ -146,12 +178,20 @@ async def send_telegram(text: str) -> None:
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
-    return {"service": "xauusd-tv-webhook", "status": "live", "endpoints": ["/health", "/status", "/webhook"]}
+    return {
+        "service": "xauusd-tv-macd-bot",
+        "status": "live",
+        "endpoints": ["/health", "/status", "/webhook"],
+    }
 
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"status": "ok", "mode": "tradingview_webhook", "rr": f"1:{RR_RATIO:g}"}
+    return {
+        "status": "ok",
+        "mode": "tradingview_macd_sr_dxy_us10y_cpi_nfp",
+        "rr": f"1:{RR_RATIO:g}",
+    }
 
 
 @app.get("/status")
@@ -175,30 +215,31 @@ async def webhook(request: Request) -> JSONResponse:
     if WEBHOOK_SECRET and str(payload.get("secret", "")).strip() != WEBHOOK_SECRET:
         return JSONResponse(status_code=401, content={"ok": False, "error": "Unauthorized secret"})
 
-    side = str(payload.get("side", payload.get("action", ""))).upper().strip()
+    side = str(payload.get("side", "")).upper().strip()
     if side not in ("BUY", "SELL"):
         return JSONResponse(status_code=400, content={"ok": False, "error": "side must be BUY or SELL"})
 
     try:
         entry = float(payload["price"])
-        atr = float(payload.get("atr", 4.0))
-        swing_high = float(payload["swing_high"]) if payload.get("swing_high") is not None else None
-        swing_low = float(payload["swing_low"]) if payload.get("swing_low") is not None else None
+        support = float(payload["support"]) if payload.get("support") is not None else None
+        resistance = float(payload["resistance"]) if payload.get("resistance") is not None else None
     except (KeyError, TypeError, ValueError) as exc:
-        return JSONResponse(status_code=400, content={"ok": False, "error": f"Missing/invalid numeric fields: {exc}"})
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid numeric fields: {exc}"})
 
     symbol = str(payload.get("symbol", "XAUUSD"))
     bar_time = str(payload.get("time", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
-    d1_info = str(payload.get("d1_trend", "D1 EMA20"))
-    macro_info = str(payload.get("macro", "DXY / US10Y"))
-    ind_info = str(payload.get("indicators", f"ATR={atr:.2f}"))
+    xau_d1 = str(payload.get("xau_d1", "N/A"))
+    xau_h1 = str(payload.get("xau_h1", "N/A"))
+    macd_info = str(payload.get("macd", "N/A"))
+    dxy_info = str(payload.get("dxy_d1_h1", "N/A"))
+    us10y_info = str(payload.get("us10y_d1_h1", "N/A"))
 
-    blocked, news_msg = await check_usd_high_news()
-    LATEST_STATUS["news_status"] = news_msg
+    blocked, news_status = await check_cpi_nfp_forexfactory()
+    LATEST_STATUS["cpi_nfp_status"] = news_status
     if blocked:
-        return JSONResponse(status_code=200, content={"ok": True, "skipped": news_msg})
+        return JSONResponse(status_code=200, content={"ok": True, "skipped": news_status})
 
-    sl, tp, sl_dist, tp_dist, sr_ref = compute_sl_tp(side, entry, atr, swing_high, swing_low)
+    sl, tp, sl_dist, tp_dist, sr_label = calc_sr_sl_tp(side, entry, support, resistance)
     sig_key = f"{symbol}:{side}:{bar_time}"
 
     state = read_state()
@@ -208,15 +249,17 @@ async def webhook(request: Request) -> JSONResponse:
 
     badge = "🟢" if side == "BUY" else "🔴"
     msg = (
-        f"{badge} <b>{symbol} | TradingView → {side}</b>\n"
-        f"• Nến: <code>{bar_time}</code>\n"
-        f"• Entry: <code>{entry:.2f}</code>\n"
-        f"• SL: <code>{sl:.2f}</code> (<code>{sl_dist:.2f}</code> giá | {sr_ref})\n"
-        f"• TP: <code>{tp:.2f}</code> (<code>{tp_dist:.2f}</code> giá | R:R <code>1:{RR_RATIO:g}</code>)\n"
-        f"• Xu hướng D1: {d1_info}\n"
-        f"• Chỉ báo: {ind_info}\n"
-        f"• Vĩ mô: {macro_info}\n"
-        f"• Tin tức: {news_msg}"
+        f"{badge} <b>{symbol} | {side} (R:R 1:{RR_RATIO:g})</b>\n"
+        f"• Thời gian nến: <code>{bar_time}</code>\n"
+        f"• <b>Entry:</b> <code>{entry:.2f}</code>\n"
+        f"• <b>SL:</b> <code>{sl:.2f}</code> (<code>{sl_dist:.2f}</code> giá | {sr_label})\n"
+        f"• <b>TP:</b> <code>{tp:.2f}</code> (<code>{tp_dist:.2f}</code> giá)\n"
+        f"• <b>XAUUSD D1:</b> {xau_d1}\n"
+        f"• <b>XAUUSD H1:</b> {xau_h1}\n"
+        f"• <b>MACD:</b> {macd_info}\n"
+        f"• <b>DXY (D1/H1):</b> {dxy_info}\n"
+        f"• <b>US10Y (D1/H1):</b> {us10y_info}\n"
+        f"• <b>Tin CPI / Non-Farm:</b> {news_status}"
     )
 
     await send_telegram(msg)
